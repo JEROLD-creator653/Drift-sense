@@ -1,0 +1,1021 @@
+"""Localization of the reference pattern inside the search image.
+
+The reference is blurred to a bank of plausible search optics resolutions,
+resampled onto the search pixel grid through a single affine transform per
+rotation and scale hypothesis, and matched with normalized cross correlation.
+A hypothesis grid is screened at quarter resolution, the top six hypotheses
+are rescored at full resolution and the best is refined on a shrinking grid of
+five levels. The grid covers the Phase 2 constraints directly: rotation over
+plus minus 5 deg in nine steps, and scale over 0.8 to 1.2 of the nominal ten
+times zoom in seventeen steps, which spans the disclosed eight to twelve range
+rather than assuming a fixed magnification. The reference is blurred to six
+resolutions, and a low confidence pair is retried against four wider ones.
+Contrast polarity is detected from the signed correlation scores so inverted
+tone conventions still match. Candidate peaks within a
+tolerance of the best score are collected; a residual disambiguation stage
+separates lattice degenerate candidates by their deviation fields, and when
+indecisive the problem statement tie break returns the candidate closest to
+the search image center. Sub pixel output comes from a parabolic fit on the
+correlation peak.
+"""
+
+import time
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+from scipy.ndimage import affine_transform, maximum_filter
+
+from . import backend
+
+
+@dataclass
+class MatchConfig:
+    zoom: float = 10.0
+    device: str = "cpu"
+    template_px: int = 90
+    scale_adaptive_template: bool = True
+    psf_sigma_bank_nm: tuple = (2.0, 4.0, 6.5, 9.0, 14.0, 20.0)
+    wide_sigma_bank_nm: tuple = (4.0, 9.0, 16.0, 25.0)
+    antialias: bool = False
+    nominal_preference: float = 0.02
+    nominal_accept_score: float = 9.9
+    bandpass_sigma_px: float = 25.0
+    denoise_sigma_px: float = 0.6
+    adaptive_denoise: bool = True
+    denoise_noise_gain: float = 0.04
+    denoise_sigma_max: float = 2.0
+    impulse_median_ksize: int = 3
+    impulse_detect_frac: float = 0.005
+    impulse_detect_delta: int = 55
+    tone_norm: str = "none"
+    coarse_rotations_deg: tuple = (-5.0, -3.75, -2.5, -1.25, 0.0, 1.25, 2.5, 3.75, 5.0)
+    coarse_scales: tuple = (0.8, 0.825, 0.85, 0.875, 0.9, 0.925, 0.95, 0.975, 1.0, 1.025, 1.05, 1.075, 1.1, 1.125, 1.15, 1.175, 1.2)
+    prescreen_downsample: int = 4
+    prescreen_top_k: int = 6
+    refine_rot_step_deg: float = 0.375
+    refine_scale_step: float = 0.0075
+    refine_levels: int = 5
+    peak_tolerance: float = 0.003
+    time_budget_s: float = 15.0
+    theta_report_sign: float = -1.0
+    quadrant_window_px: int = 12
+    stage2_tolerance_frac: float = 0.6
+    stage2_tolerance_cap: float = 0.06
+    peak_min_separation_px: int = 4
+    residual_disambiguation: bool = True
+    residual_pad_px: int = 3
+    residual_min_candidates: int = 2
+    residual_margin: float = 0.035
+    residual_margin_floor: float = 0.02
+    residual_z_thresh: float = 5.0
+    residual_z_pool_min: int = 9
+    residual_median_k: int = 31
+    residual_rms_rerank: bool = True
+    residual_rms_margin: float = 0.045
+    rerank_combiner: bool = True
+    rerank_combiner_margin: float = 9.0
+    raw_override: bool = True
+    raw_override_margin: float = 0.05
+    raw_override_min_peak: float = 0.25
+    pose_arbiter: bool = True
+    pose_arbiter_top_k: int = 4
+    pose_arbiter_margin: float = 0.05
+    streak_suppress: bool = True
+    streak_k_mad: float = 5.0
+    streak_min_gray: float = 10.0
+    residual_rms_top_k: int = 10
+    reranker_path: str = ""
+    reranker_prob: float = 0.5
+    reranker_pool: int = 48
+
+
+def _despeckle(img, cfg):
+    """Remove impulse noise when present.
+
+    Salt and pepper pixels are unbounded outliers, so they dominate the sums
+    inside normalized cross correlation and are not attenuated by Gaussian
+    denoising. A 3x3 median removes them exactly, but it also softens fine
+    structure, so it is applied only when the impulse fraction is detectable.
+    """
+    if cfg.impulse_median_ksize <= 1 or img.dtype != np.uint8:
+        return img, 0.0
+    med = cv2.medianBlur(img, cfg.impulse_median_ksize)
+    frac = float(np.mean(np.abs(img.astype(np.int16) - med.astype(np.int16))
+                         > cfg.impulse_detect_delta))
+    return (med if frac >= cfg.impulse_detect_frac else img), frac
+
+
+def _tone_normalize(img, cfg):
+    """Remove monotonic intensity differences between the two captures.
+
+    Correlation is invariant to affine intensity changes but not to the gamma
+    and contrast curve differences the organiser specification allows, so
+    mapping both captures to a uniform histogram makes any monotonic tone
+    difference irrelevant.
+    """
+    if cfg.tone_norm == "none" or img.dtype != np.uint8:
+        return img
+    if cfg.tone_norm == "equalize":
+        return cv2.equalizeHist(img)
+    if cfg.tone_norm == "clahe":
+        return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(img)
+    raise ValueError(f"unknown tone_norm {cfg.tone_norm}")
+
+
+_NOISE_KERNEL = np.array([[1.0, -2.0, 1.0],
+                          [-2.0, 4.0, -2.0],
+                          [1.0, -2.0, 1.0]], dtype=np.float32)
+
+
+def _noise_sigma(img):
+    """Immerkaer style noise estimate, median based so edges do not inflate it."""
+    lap = cv2.filter2D(img.astype(np.float32), -1, _NOISE_KERNEL)
+    return float(np.sqrt(np.pi / 2.0) * np.median(np.abs(lap)) / 6.0)
+
+
+def _suppress_streak_rows(img, cfg):
+    """Correct additive full width streak rows on the search capture.
+
+    The baseline is phase aware, each row compared against the median of rows
+    sharing its lattice phase, so periodic word line rows read zero and only
+    sporadic streaks are lifted; frames where over thirty percent of rows
+    flag are structure and are left untouched."""
+    from scipy.ndimage import median_filter
+    x = img.astype(np.float32)
+    row_med = np.median(x, axis=1)
+    smooth = median_filter(row_med, size=61, mode="nearest")
+    detr = row_med - smooth
+    f = np.abs(np.fft.rfft(detr * np.hanning(len(detr))))
+    f[:2] = 0
+    kbin = int(np.argmax(f))
+    period = int(round(len(detr) / kbin)) if kbin else 0
+    if kbin and f[kbin] > 4 * np.median(f) and 2 <= period <= 64:
+        base = np.empty_like(detr)
+        for ph in range(period):
+            base[ph::period] = np.median(detr[ph::period])
+    else:
+        base = median_filter(detr, size=31, mode="nearest")
+    resid = detr - base
+    mad = np.median(np.abs(resid - np.median(resid))) + 1e-6
+    hot = resid > max(cfg.streak_min_gray, cfg.streak_k_mad * 1.4826 * mad)
+    hot[:32] = False
+    hot[-32:] = False
+    n = int(hot.sum())
+    if n == 0 or n > int(x.shape[0] * 0.30):
+        return img, 0
+    x[hot] -= resid[hot, None]
+    return np.clip(x, 0, 255).astype(img.dtype), n
+
+
+def _preprocess(img, cfg, denoise):
+    x = img.astype(np.float32)
+    noise = 0.0
+    if denoise and cfg.denoise_sigma_px > 0:
+        sigma = cfg.denoise_sigma_px
+        if cfg.adaptive_denoise:
+            noise = _noise_sigma(img)
+            sigma = float(np.clip(cfg.denoise_noise_gain * noise,
+                                  cfg.denoise_sigma_px, cfg.denoise_sigma_max))
+        x = backend.gaussian(x, sigma, cfg.device)
+    if cfg.bandpass_sigma_px > 0:
+        x = x - _lowpass(x, cfg.bandpass_sigma_px, cfg)
+    return x, noise
+
+
+def _lowpass(x, sigma, cfg):
+    """The bandpass's low frequency estimate.
+
+    A sigma beyond the frame converges to the frame mean, so that case
+    returns the closed form answer instead of a multi second convolution.
+    """
+    if sigma >= min(x.shape[:2]):
+        return np.full_like(x, float(np.mean(x)))
+    return backend.gaussian(x, sigma, cfg.device)
+
+
+def _effective_sigma(spot_nm, cfg):
+    """Template blur matching the search image's formation.
+
+    A search pixel integrates a zoom by zoom block of specimen area, which is a
+    box filter of variance zoom squared over twelve. Point sampling the
+    reference without that pre filter leaves aliasing the search image does not
+    have, so the box is folded into the template blur in quadrature with the
+    beam spot.
+    """
+    if not cfg.antialias:
+        return spot_nm
+    box = cfg.zoom / np.sqrt(12.0)
+    return float(np.hypot(spot_nm, box))
+
+
+def _make_template(ref_band, theta_deg, scale, cfg):
+    t = cfg.template_px
+    if cfg.scale_adaptive_template and scale < 1.0:
+        t = int(round(cfg.template_px / scale))
+    zoom = cfg.zoom * scale
+    if cfg.scale_adaptive_template:
+        t = min(t, int(ref_band.shape[0] / zoom))
+    ang = np.deg2rad(theta_deg)
+    rot = np.array([[np.cos(ang), -np.sin(ang)], [np.sin(ang), np.cos(ang)]])
+    matrix = rot * zoom
+    half = (t - 1) / 2.0
+    center_ref = np.array([(ref_band.shape[0] - 1) / 2.0,
+                           (ref_band.shape[1] - 1) / 2.0])
+    offset = center_ref - matrix @ np.array([half, half])
+    return affine_transform(ref_band, matrix, offset=offset,
+                            output_shape=(t, t), order=1, mode="constant",
+                            cval=float(ref_band.mean()))
+
+
+def _parabolic(v_m, v_0, v_p):
+    denom = v_m - 2 * v_0 + v_p
+    if abs(denom) < 1e-9:
+        return 0.0
+    return float(np.clip(0.5 * (v_m - v_p) / denom, -0.5, 0.5))
+
+
+def _residual_rms_at(search, tmpl, py, px):
+    """RMS of the residual after a gain and offset least squares fit."""
+    t = tmpl.shape[0]
+    win = search[py:py + t, px:px + t].astype(np.float64)
+    if win.shape != tmpl.shape:
+        return None
+    tv = tmpl.astype(np.float64)
+    tz = tv - tv.mean()
+    a = float((win * tz).sum() / max((tz * tz).sum(), 1e-9))
+    r = win - a * tv - (win.mean() - a * tv.mean())
+    return float(r.std())
+
+
+_COMBINER = {"model": None, "path": None}
+
+
+def _load_combiner():
+    """The re rank model, loaded once per process from beside the package."""
+    import json
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent.parent / "models" / "rerank_combiner.json"
+    if _COMBINER["path"] != str(path):
+        try:
+            with open(path) as fh:
+                _COMBINER["model"] = json.load(fh)
+        except (OSError, ValueError):
+            _COMBINER["model"] = None
+        _COMBINER["path"] = str(path)
+    return _COMBINER["model"]
+
+
+def _lattice_lag_of(tmpl):
+    prof = tmpl.mean(axis=0) - tmpl.mean()
+    f = np.abs(np.fft.rfft(prof * np.hanning(len(prof))))
+    f[:3] = 0
+    return max(int(round(len(prof) / max(int(np.argmax(f)), 1))), 2)
+
+
+def _lattice_lags_of(tmpl):
+    """Dominant period of each axis of the template, in pixels."""
+    lags = []
+    for prof in (tmpl.mean(axis=0), tmpl.mean(axis=1)):
+        p = prof - prof.mean()
+        f = np.abs(np.fft.rfft(p * np.hanning(len(p))))
+        f[:3] = 0
+        lags.append(max(int(round(len(p) / max(int(np.argmax(f)), 1))), 2))
+    return lags
+
+
+def _raw_confirm(ref_raw, search_raw, z_hat, theta_report, x_hat, y_hat):
+    """Full reference correlation at the estimated pose, on the raw pixels.
+
+    The released generator guarantees every present pair solvable by this
+    exact statistic within 3 px of the label, so it serves as confirmation,
+    override and pose arbiter evidence; about 15 ms per call."""
+    try:
+        k = max(2, int(round(z_hat)))
+        r = cv2.blur(ref_raw, (k, k))
+        h, w = ref_raw.shape[:2]
+        out = int(round(h / z_hat))
+        if out < 8 or out >= min(search_raw.shape[:2]):
+            return None
+        M = cv2.getRotationMatrix2D(((w - 1) / 2.0, (h - 1) / 2.0),
+                                    float(theta_report), 1.0 / z_hat)
+        M[0, 2] += (out - 1) / 2.0 - (w - 1) / 2.0
+        M[1, 2] += (out - 1) / 2.0 - (h - 1) / 2.0
+        tpl = cv2.warpAffine(r, M, (out, out), flags=cv2.INTER_LINEAR)
+        resp = cv2.matchTemplate(search_raw, tpl, cv2.TM_CCOEFF_NORMED)
+        _, peak, _, loc = cv2.minMaxLoc(resp)
+        rx = loc[0] + (out - 1) / 2.0
+        ry = loc[1] + (out - 1) / 2.0
+        rad = max(int(0.6 * out), 4)
+        masked = resp.copy()
+        masked[max(0, loc[1] - rad):loc[1] + rad + 1,
+               max(0, loc[0] - rad):loc[0] + rad + 1] = -2.0
+        second = float(masked.max())
+        dist = float(np.hypot(rx - x_hat, ry - y_hat))
+        return {"peak": float(peak), "margin": float(peak - second),
+                "agree": bool(dist <= 3.0), "dist": dist,
+                "x": float(rx), "y": float(ry)}
+    except cv2.error:
+        return None
+
+
+def _override_fires(cfg, rc):
+    """The raw override's firing decision on one confirmation record.
+
+    The margin floor sits well above the generator's own 0.02 uniqueness
+    guarantee because the statistic runs at the estimated pose, where a
+    slightly wrong zoom or rotation can hand a wrong lattice site a margin
+    just over 0.02; every observed damage margin is 0.0202 or lower across
+    two builds and an external audit, while every genuine raw resolution
+    carries 0.1089 or more, so 0.05 clears the damage band by 2.5x and the
+    rescue band clears it by 2x (experiments/20260902_raw_override_hardening)."""
+    return bool(cfg.raw_override and not rc["agree"]
+                and rc["peak"] >= cfg.raw_override_min_peak
+                and rc["margin"] >= cfg.raw_override_margin)
+
+
+def _lattice_balance_of(img):
+    """Spectral balance between the two principal axes of the reference.
+
+    A DRAM array is a two dimensional lattice and carries comparable energy on
+    both axes; a FinFET field concentrates its energy on one. Reimplements the
+    measurement recorded in experiments/20260831_architecture_dispatch, whose
+    per pair values this reproduces to machine precision; DRAM sits near 0.55
+    and FinFET near 0.24 with the genuine overlap between 0.17 and 0.38."""
+    a = img.astype(np.float64)
+    a = a - a.mean()
+    a *= np.hanning(a.shape[0])[:, None]
+    a *= np.hanning(a.shape[1])[None, :]
+    F = np.abs(np.fft.fftshift(np.fft.fft2(a)))
+    cy, cx = F.shape[0] // 2, F.shape[1] // 2
+    F[cy - 1:cy + 2, cx - 1:cx + 2] = 0
+    h, v = F[cy, :].max(), F[:, cx].max()
+    return float(min(h, v) / max(max(h, v), 1e-9))
+
+
+def _template_context(tmpl):
+    """Everything in the statistic battery that depends on the template alone.
+
+    Computed once per surface rather than once per candidate, which halves the
+    blur work of the battery; every value is identical to what the per
+    candidate computation produced, only hoisted."""
+    tv = tmpl.astype(np.float64)
+    tz = tv - tv.mean()
+    gt = np.hypot(*np.gradient(cv2.GaussianBlur(tmpl, (0, 0), 1.0)))
+    bt = cv2.GaussianBlur(tmpl, (0, 0), 8.0)
+    return {"tv": tv, "tz": tz, "tzz": max((tz * tz).sum(), 1e-9),
+            "tmean": tv.mean(), "gt": gt, "gtz": gt - gt.mean(), "gts": gt.std(),
+            "bt": bt, "btz": bt - bt.mean(), "bts": bt.std()}
+
+
+def _candidate_stats(search, tmpl, ctx, edge_n, lag, py, px, ncc):
+    """Seven statistics of the raw pixels at one candidate site.
+
+    The correlation score is one of them; the other six each read evidence the
+    correlation discards, and the fitted combination beats any one of them at
+    ranking the true site among the peaks. Order must match the model file."""
+    t = tmpl.shape[0]
+    win = search[py:py + t, px:px + t].astype(np.float64)
+    if win.shape != tmpl.shape:
+        return None
+    a = float((win * ctx["tz"]).sum() / ctx["tzz"])
+    r = win - a * ctx["tv"] - (win.mean() - a * ctx["tmean"])
+    rz = r - r.mean()
+    rs = rz.std() + 1e-9
+    wf = win.astype(np.float32)
+    gw = np.hypot(*np.gradient(cv2.GaussianBlur(wf, (0, 0), 1.0)))
+    bw = cv2.GaussianBlur(wf, (0, 0), 8.0)
+    return [
+        float(ncc),
+        -float(np.mean(np.abs(rz / rs) * edge_n)),
+        -float(abs(np.mean(rz[:, :-lag] * rz[:, lag:])) / rs ** 2),
+        -float(abs(np.mean(rz[:, :-2] * rz[:, 2:])) / rs ** 2),
+        float(((gw - gw.mean()) * ctx["gtz"]).mean() / (gw.std() * ctx["gts"] + 1e-9)),
+        float(((bw - bw.mean()) * ctx["btz"]).mean() / (bw.std() * ctx["bts"] + 1e-9)),
+        -float(rs),
+    ]
+
+
+def _combiner_rerank(search, tmpl, resp, cfg, extra_site=None):
+    """Top peaks ranked by the fitted combination of the seven statistics.
+
+    Returns (candidates, probabilities) sorted best first, or (None, None)
+    when the model is absent or fewer than two peaks are usable. extra_site,
+    when given, is appended so the classical choice is always scored even if
+    the peak suppression removed it."""
+    model = _load_combiner()
+    if model is None:
+        return None, None, None
+    t = tmpl.shape[0]
+    r = resp.copy()
+    rad = max(t // 3, 8)
+    sites = []
+    for _ in range(int(cfg.residual_rms_top_k)):
+        _, mx, _, loc = cv2.minMaxLoc(r)
+        if mx <= -1:
+            break
+        px, py = int(loc[0]), int(loc[1])
+        r[max(0, py - rad):py + rad + 1, max(0, px - rad):px + rad + 1] = -2
+        sites.append((py, px, float(mx)))
+    if extra_site is not None and all(
+            np.hypot(extra_site[0] - py, extra_site[1] - px) > 2 for py, px, _ in sites):
+        ey, ex = extra_site
+        if 0 <= ey < resp.shape[0] and 0 <= ex < resp.shape[1]:
+            sites.append((ey, ex, float(resp[ey, ex])))
+    lag = min(_lattice_lag_of(tmpl), max(tmpl.shape[1] // 2, 2))
+    edge = np.hypot(*np.gradient(tmpl))
+    edge_n = edge / (edge.std() + 1e-9)
+    ctx = _template_context(tmpl)
+    mu = np.asarray(model["mu"], float)
+    sd = np.asarray(model["sd"], float)
+    wv = np.asarray(model["weights"], float)
+    cands, probs, stats = [], [], []
+    for py, px, ncc in sites:
+        f = _candidate_stats(search, tmpl, ctx, edge_n, lag, py, px, ncc)
+        if f is None or not np.all(np.isfinite(f)):
+            continue
+        z = (np.asarray(f) - mu) / sd
+        m = float(z @ wv + model["bias"])
+        cands.append((py, px))
+        probs.append(1.0 / (1.0 + np.exp(-m)))
+        stats.append([float(v) for v in f])
+    if len(cands) < 2:
+        return None, None, None
+    order = np.argsort(probs)[::-1]
+    return ([cands[i] for i in order], [probs[i] for i in order],
+            [stats[i] for i in order])
+
+
+def _rms_rerank(search, tmpl, resp, cfg):
+    """Top peaks of the correlation surface ranked by absolute residual.
+
+    Returns (candidates, rms values) with candidates as (py, px) rows, best
+    residual first, or (None, None) when fewer than two peaks are usable."""
+    t = tmpl.shape[0]
+    r = resp.copy()
+    rad = max(t // 3, 8)
+    cands, rmss = [], []
+    for _ in range(int(cfg.residual_rms_top_k)):
+        _, mx, _, loc = cv2.minMaxLoc(r)
+        if mx <= -1:
+            break
+        px, py = int(loc[0]), int(loc[1])
+        r[max(0, py - rad):py + rad + 1, max(0, px - rad):px + rad + 1] = -2
+        v = _residual_rms_at(search, tmpl, py, px)
+        if v is None:
+            continue
+        cands.append((py, px))
+        rmss.append(v)
+    if len(cands) < 2:
+        return None, None
+    order = np.argsort(rmss)
+    return [cands[i] for i in order], [rmss[i] for i in order]
+
+
+def _residual_score_map(search, tmpl, aligned_positions, cfg):
+    """Cell to cell reference subtraction, computed densely.
+
+    The pixelwise median over the best aligned candidate windows estimates the
+    shared periodic content. The normalized correlation between the template's
+    deviation field and every window's deviation field then decomposes into
+    two raw correlations plus integral image sums, giving an exact dense score
+    map with no candidate selection bias."""
+    t = tmpl.shape[0]
+    n_pix = float(t * t)
+    k = min(cfg.residual_median_k, len(aligned_positions))
+    if k % 2 == 0:
+        k -= 1
+    stack = np.stack([search[py:py + t, px:px + t]
+                      for py, px in aligned_positions[:k]])
+    med = np.median(stack, axis=0).astype(np.float32)
+    gy_m, gx_m = np.gradient(med)
+    basis = np.stack([np.ones_like(med).ravel(), med.ravel(),
+                      gx_m.ravel(), gy_m.ravel()], axis=1)
+    coef, _, _, _ = np.linalg.lstsq(basis, tmpl.ravel(), rcond=None)
+    rt0 = np.ascontiguousarray((tmpl.ravel() - basis @ coef).reshape(med.shape))
+    e_rt = float(np.sum(rt0 * rt0))
+    if e_rt < 1e-4 * float(np.sum(med * med)):
+        return None, med, None
+
+    corr_rt = cv2.matchTemplate(search, rt0, cv2.TM_CCORR).astype(np.float64)
+    corr_med = cv2.matchTemplate(search, np.ascontiguousarray(med),
+                                 cv2.TM_CCORR).astype(np.float64)
+    c_med_rt = float(np.sum(med.astype(np.float64) * rt0))
+    num = corr_rt - c_med_rt
+
+    s64 = search.astype(np.float64)
+    i1 = cv2.integral(s64)
+    i2 = cv2.integral(s64 * s64)
+    s1 = i1[t:, t:] - i1[:-t, t:] - i1[t:, :-t] + i1[:-t, :-t]
+    s2 = i2[t:, t:] - i2[:-t, t:] - i2[t:, :-t] + i2[:-t, :-t]
+    sum_med = float(np.sum(med, dtype=np.float64))
+    sum_med2 = float(np.sum(med.astype(np.float64) ** 2))
+    var = s2 - 2.0 * corr_med + sum_med2 - (s1 - sum_med) ** 2 / n_pix
+    np.clip(var, 1e-6, None, out=var)
+    return (num / np.sqrt(var * e_rt)).astype(np.float32), med, rt0
+
+
+def locate(ref_img, search_img, cfg=None, return_artifacts=False, t_start=None):
+    cfg = cfg or MatchConfig()
+    t0 = time.perf_counter() if t_start is None else t_start
+    lattice_balance = _lattice_balance_of(ref_img)
+    ref_raw, search_raw = ref_img, search_img
+    ref_img, ref_impulse = _despeckle(ref_img, cfg)
+    search_img, search_impulse = _despeckle(search_img, cfg)
+    ref_img = _tone_normalize(ref_img, cfg)
+    search_img = _tone_normalize(search_img, cfg)
+    streak_rows = 0
+    if cfg.streak_suppress:
+        search_img, streak_rows = _suppress_streak_rows(search_img, cfg)
+    ref = ref_img.astype(np.float32)
+    ref_low = _lowpass(ref, cfg.bandpass_sigma_px * cfg.zoom, cfg)
+    all_sigmas = sorted(set(cfg.psf_sigma_bank_nm) | set(cfg.wide_sigma_bank_nm))
+    ref_bank = {s: backend.gaussian(ref, _effective_sigma(s, cfg), cfg.device) - ref_low
+                for s in all_sigmas}
+    search, search_noise = _preprocess(search_img, cfg, denoise=True)
+    corr = backend.make_correlator(search, cfg.device)
+
+    tried = {}
+
+    def evaluate(sig, theta, scale):
+        key = (round(theta, 4), round(scale, 5), sig)
+        if key in tried:
+            return tried[key]
+        tmpl = _make_template(ref_bank[sig], theta, scale, cfg)
+        pk = float(corr.peaks([tmpl])[0])
+        tried[key] = pk if np.isfinite(pk) else -2.0
+        return tried[key]
+
+    def evaluate_many(items):
+        """The serial evaluate over independent poses, batched so the
+        correlator can spread the surfaces over the machine's cores; keys
+        enter the tried table in the given order, so every tie break that
+        reads insertion order is unchanged."""
+        fresh = []
+        for sig, theta, scale in items:
+            key = (round(theta, 4), round(scale, 5), sig)
+            if key not in tried and key not in [k for k, _ in fresh]:
+                fresh.append((key, (sig, theta, scale)))
+        if not fresh:
+            return
+        tmpls = backend.map_parallel(
+            lambda a: _make_template(ref_bank[a[0]], a[1], a[2], cfg),
+            [a for _, a in fresh])
+        for (key, _), pk in zip(fresh, corr.peaks(tmpls)):
+            pk = float(pk)
+            tried[key] = pk if np.isfinite(pk) else -2.0
+
+    def refine(seed_key):
+        """Local descent on rotation and scale, keeping the seed's blur level."""
+        best_local = seed_key
+        rot_step = cfg.refine_rot_step_deg * 2
+        scale_step = cfg.refine_scale_step * 2
+        for _ in range(cfg.refine_levels):
+            th0, sc0, sig0 = best_local
+            neighbourhood = [best_local]
+            steps = ((th0 - rot_step, sc0), (th0 + rot_step, sc0),
+                     (th0, sc0 - scale_step), (th0, sc0 + scale_step))
+            evaluate_many([(sig0, th, sc) for th, sc in steps])
+            for th, sc in steps:
+                neighbourhood.append((round(th, 4), round(sc, 5), sig0))
+            best_local = max(neighbourhood, key=tried.get)
+            rot_step /= 2
+            scale_step /= 2
+        return best_local
+
+    ds = cfg.prescreen_downsample
+    small = cv2.resize(search, (search.shape[1] // ds, search.shape[0] // ds),
+                       interpolation=cv2.INTER_AREA)
+    ts = cfg.template_px // ds
+    pol_mx = pol_mn = 0.0
+    pol_tmpls = [cv2.resize(_make_template(ref_bank[sig], 0.0, 1.0, cfg), (ts, ts),
+                            interpolation=cv2.INTER_AREA)
+                 for sig in cfg.wide_sigma_bank_nm]
+    corr_small = backend.make_correlator(small, cfg.device)
+    for mn, mx in corr_small.peaks(pol_tmpls, want_min=True):
+        pol_mx, pol_mn = max(pol_mx, mx), min(pol_mn, mn)
+    inverted = -pol_mn > pol_mx
+    if inverted:
+        search = -search
+        search_raw = (255 - search_raw).astype(search_raw.dtype)
+        corr = backend.make_correlator(search, cfg.device)
+        small = -small
+        corr_small = backend.make_correlator(small, cfg.device)
+        tried.clear()
+
+    evaluate_many([(sig, 0.0, 1.0) for sig in cfg.psf_sigma_bank_nm])
+    nominal_key = max(tried, key=tried.get)
+    nominal_key = refine(nominal_key)
+    nominal_score = tried[nominal_key]
+
+    wide_score = nominal_score
+    wide_key = nominal_key
+    used_wide = False
+    pose_arbiter_diag = None
+    budget_left = lambda frac: (time.perf_counter() - t0) < cfg.time_budget_s * frac
+    budget_gated = nominal_score < cfg.nominal_accept_score and not budget_left(0.45)
+    if nominal_score < cfg.nominal_accept_score and budget_left(0.45):
+        poses, grid_tmpls = [], []
+        for sig in cfg.wide_sigma_bank_nm:
+            for th in cfg.coarse_rotations_deg:
+                for sc in cfg.coarse_scales:
+                    if th == 0.0 and sc == 1.0:
+                        continue
+                    poses.append((sig, th, sc))
+
+        def _grid_tmpl(a):
+            tmpl_h = _make_template(ref_bank[a[0]], a[1], a[2], cfg)
+            th_px = max(tmpl_h.shape[0] // ds, 8)
+            return cv2.resize(tmpl_h, (th_px, th_px), interpolation=cv2.INTER_AREA)
+
+        grid_tmpls = backend.map_parallel(_grid_tmpl, poses)
+        peaks = corr_small.peaks(grid_tmpls)
+        prescreen = [(peak, sig, th, sc)
+                     for peak, (sig, th, sc) in zip(peaks, poses)]
+        prescreen.sort(key=lambda p: -p[0])
+        evaluate_many([(sig, th, sc)
+                       for _, sig, th, sc in prescreen[:cfg.prescreen_top_k]])
+        wide_keys = []
+        for _, sig, th, sc in prescreen[:cfg.prescreen_top_k]:
+            wide_keys.append((round(th, 4), round(sc, 5), sig))
+        cand = max(wide_keys, key=tried.get, default=nominal_key)
+        cand = refine(cand)
+        if tried[cand] > nominal_score + cfg.nominal_preference:
+            wide_key, wide_score, used_wide = cand, tried[cand], True
+
+        if cfg.pose_arbiter and budget_left(0.75):
+            best_key = wide_key if used_wide else nominal_key
+            best_th, best_sc, best_sig = best_key
+            seen, cands = set(), []
+
+            def _add(th_k, sc_k, sig_k):
+                nm = (round(float(th_k), 2), round(float(sc_k), 3))
+                if nm not in seen:
+                    seen.add(nm)
+                    cands.append((float(th_k), float(sc_k), sig_k))
+
+            _add(*best_key)
+            for k in sorted(tried, key=tried.get, reverse=True)[:cfg.pose_arbiter_top_k]:
+                _add(*k)
+            for _, sig_p, th_p, sc_p in prescreen[:6]:
+                _add(th_p, sc_p, sig_p)
+            for sc_l in (0.8, 0.9, 1.1, 1.2):
+                _add(best_th, sc_l, best_sig)
+            scored = []
+            for th_k, sc_k, sig_k in cands:
+                rc = _raw_confirm(ref_raw, search_raw, sc_k * cfg.zoom,
+                                  cfg.theta_report_sign * th_k, 0.0, 0.0)
+                scored.append(((th_k, sc_k, sig_k),
+                               rc["peak"] if rc else -1.0,
+                               rc["margin"] if rc else 0.0))
+            cur = scored[0]
+            top = max(scored, key=lambda s: s[1])
+            pose_arbiter_diag = {
+                "cands": [[k[0], k[1], float(pk), float(mg)]
+                          for k, pk, mg in scored],
+                "cur_raw": float(cur[1]), "top_raw": float(top[1]),
+                "fired": False}
+            if (top[0][:2] != (best_th, best_sc)
+                    and top[1] >= cfg.raw_override_min_peak
+                    and top[1] >= cur[1] + cfg.pose_arbiter_margin):
+                th_w, sc_w, sig_w = top[0]
+                evaluate(sig_w, th_w, sc_w)
+                switched = refine((round(th_w, 4), round(sc_w, 5), sig_w))
+                wide_key, wide_score, used_wide = switched, tried[switched], True
+                pose_arbiter_diag["fired"] = True
+
+    best = wide_key if used_wide else nominal_key
+    theta_best, scale_best, sigma_best = best
+    tmpl_best = _make_template(ref_bank[sigma_best], theta_best, scale_best, cfg)
+    resp = corr.full(tmpl_best)
+    score_best = float(resp.max())
+    _py0, _px0 = np.unravel_index(int(np.argmax(resp)), resp.shape)
+    _stab = []
+    for _dth in (-cfg.refine_rot_step_deg, cfg.refine_rot_step_deg):
+        _tp = _make_template(ref_bank[sigma_best], theta_best + _dth, scale_best, cfg)
+        _rp = corr.full(_tp)
+        if _rp.shape == resp.shape:
+            _pyy, _pxx = np.unravel_index(int(np.argmax(_rp)), _rp.shape)
+            _stab.append(float(np.hypot(_pxx - _px0, _pyy - _py0)))
+    pose_stability_px = float(np.median(_stab)) if _stab else -1.0
+
+    _rf = resp.ravel()
+    _med = float(np.median(_rf))
+    _mad = float(np.median(np.abs(_rf - _med)))
+    _p99 = float(np.quantile(_rf, 0.99))
+    peak_prominence = (score_best - _med) / max(1.4826 * _mad, 1e-6)
+    peak_over_p99 = score_best - _p99
+
+    tol_wide = min(cfg.stage2_tolerance_cap,
+                   max(cfg.peak_tolerance,
+                       cfg.stage2_tolerance_frac * (1.0 - score_best)))
+    local_max = maximum_filter(resp, size=cfg.peak_min_separation_px) == resp
+    wide = np.argwhere(local_max & (resp >= score_best - tol_wide))
+    strict = np.argwhere(local_max & (resp >= score_best - cfg.peak_tolerance))
+    t = tmpl_best.shape[0]
+    half = (t - 1) / 2.0
+    center = (search.shape[1] - 1) / 2.0, (search.shape[0] - 1) / 2.0
+    dists = [(np.hypot(c[1] + half - center[0], c[0] + half - center[1]), c)
+             for c in strict]
+    dists.sort(key=lambda item: item[0])
+
+    stage2 = {"used": False, "evaluated": 0, "margin": None,
+              "tol_wide": float(tol_wide)}
+    x = y = None
+    r2 = med = rt0 = None
+    if (cfg.residual_disambiguation and len(wide) >= cfg.residual_min_candidates
+            and not budget_left(0.75)):
+        budget_gated = True
+    if (cfg.residual_disambiguation and len(wide) >= cfg.residual_min_candidates
+            and budget_left(0.75)):
+        ordered = sorted(([int(c[0]), int(c[1])] for c in wide),
+                         key=lambda c: -resp[c[0], c[1]])
+        r2, med, rt0 = _residual_score_map(search, tmpl_best, ordered, cfg)
+        decisive = False
+        if r2 is not None:
+            slack = 2 * cfg.residual_pad_px + 1
+            vals = r2[wide[:, 0], wide[:, 1]]
+            wi = int(np.argmax(vals))
+            d2 = (wide[:, 0] - wide[wi, 0]) ** 2 + (wide[:, 1] - wide[wi, 1]) ** 2
+            others = vals[d2 > slack * slack]
+            margin = float(vals[wi] - others.max()) if others.size else 1.0
+            med_v = float(np.median(vals))
+            mad = float(np.median(np.abs(vals - med_v)))
+            z = (float(vals[wi]) - med_v) / max(1.4826 * mad, 1e-6)
+            order = np.argsort(-vals)
+            stage2.update(evaluated=int(len(vals)), margin=margin, z=float(z),
+                          mad=float(mad), residual_median=med_v,
+                          best_residual_score=float(vals[wi]),
+                          top_scores=[float(v) for v in vals[order[:8]]])
+            if len(vals) >= cfg.residual_z_pool_min:
+                decisive = z >= cfg.residual_z_thresh and margin >= cfg.residual_margin_floor
+            else:
+                decisive = margin >= cfg.residual_margin
+            if cfg.reranker_path:
+                from .reranker import rerank
+                choice, prob = rerank(search, tmpl_best, med, rt0, resp, r2,
+                                      wide, cfg)
+                stage2.update(reranker_prob=float(prob),
+                              reranker_abstained=choice is None)
+                if choice is not None:
+                    wi = int(choice)
+                    decisive = True
+        if decisive:
+            py, px = int(wide[wi, 0]), int(wide[wi, 1])
+            dx = dy = 0.0
+            if 0 < px < resp.shape[1] - 1:
+                dx = _parabolic(resp[py, px - 1], resp[py, px], resp[py, px + 1])
+            if 0 < py < resp.shape[0] - 1:
+                dy = _parabolic(resp[py - 1, px], resp[py, px], resp[py + 1, px])
+            x = px + dx + half
+            y = py + dy + half
+            stage2["used"] = True
+
+    if x is None:
+        peak = dists[0][1]
+        py, px = int(peak[0]), int(peak[1])
+        dx = dy = 0.0
+        if 0 < px < resp.shape[1] - 1:
+            dx = _parabolic(resp[py, px - 1], resp[py, px], resp[py, px + 1])
+        if 0 < py < resp.shape[0] - 1:
+            dy = _parabolic(resp[py - 1, px], resp[py, px], resp[py + 1, px])
+        x = px + dx + half
+        y = py + dy + half
+
+    rms_diag = None
+    rr_diag = None
+    if cfg.rerank_combiner and resp is not None:
+        cy, cx = int(round(y - half)), int(round(x - half))
+        r_cands, r_probs, r_stats = _combiner_rerank(search, tmpl_best, resp, cfg,
+                                                      extra_site=(cy, cx))
+        if r_cands is not None:
+            p_cls = 0.0
+            for (py2, px2), pr in zip(r_cands, r_probs):
+                if np.hypot(py2 - cy, px2 - cx) <= 2.0:
+                    p_cls = pr
+                    break
+            b_py, b_px = r_cands[0]
+            agree = bool(np.hypot(b_py - cy, b_px - cx) <= 2.0)
+            margin2 = float(r_probs[0] - (r_probs[1] if len(r_probs) > 1 else 0.0))
+            rr_diag = {"score": float(r_probs[0]), "margin": margin2,
+                       "agree": agree, "fired": False,
+                       "classical_score": float(p_cls),
+                       "top_rc": [int(b_py), int(b_px)],
+                       "classical_rc": [int(cy), int(cx)]}
+            if getattr(cfg, "rerank_record_stats", False):
+                rr_diag["candidates"] = [
+                    {"rc": [int(a), int(b)], "prob": float(pr), "stats": st}
+                    for (a, b), pr, st in zip(r_cands, r_probs, r_stats)]
+            if (not agree
+                    and float(r_probs[0]) - p_cls >= cfg.rerank_combiner_margin):
+                dx2 = dy2 = 0.0
+                if 0 < b_px < resp.shape[1] - 1:
+                    dx2 = _parabolic(resp[b_py, b_px - 1], resp[b_py, b_px],
+                                     resp[b_py, b_px + 1])
+                if 0 < b_py < resp.shape[0] - 1:
+                    dy2 = _parabolic(resp[b_py - 1, b_px], resp[b_py, b_px],
+                                     resp[b_py + 1, b_px])
+                x = b_px + dx2 + half
+                y = b_py + dy2 + half
+                py, px = b_py, b_px
+                rr_diag["fired"] = True
+    if (cfg.residual_rms_rerank and resp is not None
+            and not (rr_diag and rr_diag["fired"])):
+        r_cands, r_vals = _rms_rerank(search, tmpl_best, resp, cfg)
+        if r_cands is not None:
+            cy, cx = int(round(y - half)), int(round(x - half))
+            cur = _residual_rms_at(search, tmpl_best, cy, cx)
+            b_py, b_px = r_cands[0]
+            far = bool(np.hypot(b_py - cy, b_px - cx) > 2.0)
+            rms_diag = {"rel_margin": 0.0, "fired": False,
+                        "classical_xy": [float(x), float(y)], "rms_xy": None}
+            if cur is not None and far:
+                rel = (cur - r_vals[0]) / max(cur, 1e-9)
+                dx2 = dy2 = 0.0
+                if 0 < b_px < resp.shape[1] - 1:
+                    dx2 = _parabolic(resp[b_py, b_px - 1], resp[b_py, b_px],
+                                     resp[b_py, b_px + 1])
+                if 0 < b_py < resp.shape[0] - 1:
+                    dy2 = _parabolic(resp[b_py - 1, b_px], resp[b_py, b_px],
+                                     resp[b_py + 1, b_px])
+                rms_diag.update(rel_margin=float(rel),
+                                rms_xy=[float(b_px + dx2 + half),
+                                        float(b_py + dy2 + half)])
+                if rel >= cfg.residual_rms_margin:
+                    x = b_px + dx2 + half
+                    y = b_py + dy2 + half
+                    py, px = b_py, b_px
+                    rms_diag["fired"] = True
+
+    theta_polished = theta_best
+    py0, px0 = int(round(y - half)), int(round(x - half))
+    t_pol = tmpl_best.shape[0]
+    if (0 <= py0 and 0 <= px0 and py0 + t_pol <= search.shape[0]
+            and px0 + t_pol <= search.shape[1]):
+        win_pol = np.ascontiguousarray(search[py0:py0 + t_pol,
+                                              px0:px0 + t_pol], dtype=np.float32)
+        try:
+            warp = np.eye(2, 3, dtype=np.float32)
+            _, warp = cv2.findTransformECC(
+                np.ascontiguousarray(tmpl_best, dtype=np.float32), win_pol,
+                warp, cv2.MOTION_EUCLIDEAN,
+                (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-5))
+            r_res = float(np.degrees(np.arctan2(warp[1, 0], warp[0, 0])))
+            if abs(r_res) <= 1.5:
+                theta_polished = theta_best + r_res
+        except cv2.error:
+            pass
+
+    quad_disp, quad_agree = -1.0, -1
+    th, tw = tmpl_best.shape
+    if min(th, tw) >= 32:
+        qy, qx = int(py), int(px)
+        m = cfg.quadrant_window_px
+        offs = []
+        for qi in range(2):
+            for qj in range(2):
+                q = tmpl_best[qi * th // 2:(qi + 1) * th // 2,
+                              qj * tw // 2:(qj + 1) * tw // 2]
+                oy, ox = qi * th // 2, qj * tw // 2
+                sub = search[max(qy + oy - m, 0):qy + oy + q.shape[0] + m,
+                             max(qx + ox - m, 0):qx + ox + q.shape[1] + m]
+                if sub.shape[0] <= q.shape[0] or sub.shape[1] <= q.shape[1]:
+                    continue
+                r = cv2.matchTemplate(np.ascontiguousarray(sub),
+                                      np.ascontiguousarray(q),
+                                      cv2.TM_CCOEFF_NORMED)
+                ry, rx = np.unravel_index(int(np.argmax(r)), r.shape)
+                base_y = max(qy + oy - m, 0)
+                base_x = max(qx + ox - m, 0)
+                offs.append(((base_y + ry) - (qy + oy), (base_x + rx) - (qx + ox)))
+        if len(offs) == 4:
+            d = [float(np.hypot(dy_, dx_)) for dy_, dx_ in offs]
+            quad_disp = float(np.median(d))
+            quad_agree = int(sum(1 for v in d if v <= 2.0))
+
+    lag_h, lag_v = _lattice_lags_of(tmpl_best)
+    _rad = max(lag_h, lag_v, 8)
+    _r1 = float(resp[py, px])
+    _masked = resp.copy()
+    _masked[max(0, py - _rad):py + _rad + 1, max(0, px - _rad):px + _rad + 1] = -2.0
+    _r2 = float(_masked.max())
+    period_ratio = float(max(_r2, 0.0) / _r1) if _r1 > 1e-6 else 1.0
+    peak_curv = 0.0
+    if 0 < py < resp.shape[0] - 1 and 0 < px < resp.shape[1] - 1:
+        peak_curv = float(((2 * resp[py, px] - resp[py, px - 1] - resp[py, px + 1])
+                           + (2 * resp[py, px] - resp[py - 1, px] - resp[py + 1, px]))
+                          / max(abs(_r1), 1e-6))
+
+    raw_confirm = _raw_confirm(ref_raw, search_raw,
+                               float(scale_best) * cfg.zoom,
+                               cfg.theta_report_sign * float(theta_polished),
+                               float(x), float(y))
+    if raw_confirm is not None:
+        raw_confirm["fired"] = _override_fires(cfg, raw_confirm)
+        if raw_confirm["fired"]:
+            x, y = raw_confirm["x"], raw_confirm["y"]
+
+    diag = {
+        "score": score_best,
+        "raw_confirm": raw_confirm,
+        "pose_arbiter": pose_arbiter_diag,
+        "streak_rows": int(streak_rows),
+        "lattice_balance": lattice_balance,
+        "period_ratio": period_ratio,
+        "peak_curv": peak_curv,
+        "theta_deg": float(theta_polished),
+        "theta_grid_deg": float(theta_best),
+        "scale": float(scale_best),
+        "psf_sigma_nm": float(sigma_best),
+        "pose_source": "wide_grid" if used_wide else "nominal",
+        "budget_gated": bool(budget_gated),
+        "residual_rms": rms_diag,
+        "rerank": rr_diag,
+        "nominal_score": float(nominal_score),
+        "wide_score": float(wide_score),
+        "inverted_contrast": bool(inverted),
+        "impulse_fraction": [float(ref_impulse), float(search_impulse)],
+        "search_noise_sigma": float(search_noise),
+        "template_px_used": int(t),
+        "num_candidates": int(len(strict)),
+        "num_candidates_wide": int(len(wide)),
+        "candidate_peaks_xy": [[float(c[1] + half), float(c[0] + half)]
+                               for _, c in dists[:12]],
+        "peak_value": float(resp[py, px]),
+        "resp_median": _med,
+        "resp_p99": _p99,
+        "peak_prominence": float(peak_prominence),
+        "pose_stability_px": float(pose_stability_px),
+        "quad_disp": float(quad_disp),
+        "quad_agree": int(quad_agree),
+        "peak_over_p99": float(peak_over_p99),
+        "stage2": stage2,
+        "runtime_s": time.perf_counter() - t0,
+        "response_shape": list(resp.shape),
+    }
+    if return_artifacts:
+        diag["artifacts"] = {"search": search, "template": tmpl_best,
+                             "resp": resp, "r2": r2, "med": med, "rt0": rt0,
+                             "wide": wide}
+    return float(x), float(y), diag, resp
+
+
+def optical_config():
+    return MatchConfig(psf_sigma_bank_nm=(2.0, 8.0),
+                      bandpass_sigma_px=120.0,
+                      denoise_sigma_px=1.5)
+
+
+def load_gray(path):
+    """Returns (image, is_rgb); RGB inputs are converted to luminance.
+
+    The flag reports whether the capture carries colour, decided by comparing
+    the planes with a small tolerance rather than by the array's rank, so a
+    grayscale capture exported as RGB stays on the grayscale path. Inputs
+    deeper than eight bits are coerced to the 0 to 255 range.
+    """
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(path)
+    if img.dtype == np.uint16:
+        hi = int(img.max())
+        if hi <= 255:
+            img = img.astype(np.uint8)
+        elif hi <= 4095:
+            img = np.clip(np.round(img.astype(np.float32) * (255.0 / 4095.0)), 0, 255).astype(np.uint8)
+        else:
+            img = (img >> 8).astype(np.uint8)
+    elif img.dtype != np.uint8:
+        x = np.nan_to_num(img.astype(np.float32), nan=0.0, posinf=255.0, neginf=0.0)
+        lo, hi = float(x.min()), float(x.max())
+        img = (np.zeros(x.shape, np.uint8) if hi <= lo else
+               np.clip((x - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8))
+    if img.ndim == 3:
+        planes = img[:, :, :3].astype(np.int16)
+        spread = max(int(np.abs(planes[:, :, 0] - planes[:, :, 1]).max()),
+                     int(np.abs(planes[:, :, 1] - planes[:, :, 2]).max()))
+        grey = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
+        return grey, spread > 2
+    return img, False
+
+
+def load_colour(path):
+    """Returns (planes, is_rgb) where planes is a list of matching planes.
+
+    Optical contrast can live in colour alone, so each plane is kept for per
+    plane correlation rather than collapsed to luminance.
+    """
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(path)
+    if img.ndim != 3:
+        return [img], False
+    bgr = img[:, :, :3].astype(np.float32)
+    lum = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY).astype(np.float32)
+    planes = [lum, bgr[:, :, 0] - bgr[:, :, 1], bgr[:, :, 1] - bgr[:, :, 2]]
+    out = []
+    for pl in planes:
+        lo, hi = float(pl.min()), float(pl.max())
+        out.append(np.ascontiguousarray(
+            ((pl - lo) / max(hi - lo, 1e-6) * 255.0).astype(np.uint8)))
+    return out, True

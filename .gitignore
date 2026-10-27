@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+data/
+thumbnails*.jpg
+unpacked/
+
+# Submission material and scratch work, kept out of the project repository.
+local/
+*.pptx
+*.pdf
+
+# Variant scratch data, regenerable from the variant generators
+variants/*/scratch/
+variants/*/data/
+
+# Organiser shared material, confidential, never committed
+OneDrive_1_1-9-2026/
+
+*.egg-info/
